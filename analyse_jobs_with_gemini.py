@@ -7,6 +7,8 @@ import random
 from typing import Dict, Any
 import logging
 import sys
+import argparse
+import json
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -24,19 +26,36 @@ class JobAnalyzer:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         
-        self.analysis_prompt = """Analyze and determine whether this job suitably matches the typical skills and qualifications of a new PhD graduate in computational physics, computational chemistry, or computational materials science.
+        # Move analysis instructions to system instruction for token efficiency
+        self.system_instruction = """You are an expert job analyst.
 
-First, carefully consider each job's required qualifications, duties, and field of work to see if it aligns with the background and expertise of such a candidate. Show your thinking process for every job, explaining how and why it does or does not fit before stating a clear classification ("Fits" or "Does Not Fit"). Do not make the classification before outlining your reasoning.
+Your task: Evaluate whether the job is matched to the typical skills and qualifications of a PhD graduate in computational physics, computational chemistry, or computational materials science:
+- **Thoroughly review the job's required qualifications, duties, and field of work.**
+- **Step-by-step evaluation criteria:**
+    - Technical skills alignment (programming, simulation, modeling, calculations)
+    - Scientific domain relevance (physics, chemistry, materials science)
+    - Typical soft skills match from PhD experience
+    - Any domain-specific requirements that are outside or adjacent to the above 3 fields
+- **REASONING MUST APPEAR BEFORE THE FINAL CLASSIFICATION DECISION.**  
+    - NEVER begin with or insert the classification before completing the full reasoning.
 
-Job Details:
+Classify as:
+- "Well Fits": Direct, strong alignment with expected skills & expertise
+- "Promising": Substantial overlap with likely knowledge/skills, not perfect match
+- "Does Not Fit": Insufficient alignment with background/expected skills
+
+Output format: Valid JSON only
+{"reasoning": "[VERY concise reasoning]", 
+"CLASSIFICATION": "[Well Fits/Promising/Does Not Fit]"}
+"""
+        
+        # Simplified user prompt template (much shorter now)
+        self.analysis_prompt = """Job Details:
 Title: {title}
 Company: {company}
 Location: {location}
 Description: {description}
-First Qualification: {first_qualification}
-
-Please provide your analysis and end with exactly one of: "CLASSIFICATION: Fits" or "CLASSIFICATION: Does Not Fit"
-"""
+First Qualification: {first_qualification}"""
 
     def extract_job_info(self, row: pd.Series) -> Dict[str, Any]:
         return {
@@ -47,34 +66,36 @@ Please provide your analysis and end with exactly one of: "CLASSIFICATION: Fits"
             'first_qualification': str(row.get('first_qualification', 'N/A'))
         }
 
+
     def analyze_job_with_retry(self, job_info: Dict[str, Any], max_retries: int = 5) -> tuple[str, str]:
         """Analyze job with exponential backoff for rate limiting"""
         for attempt in range(max_retries):
             try:
                 prompt = self.analysis_prompt.format(**job_info)
                 
-                # Enable thinking mode with dynamic budget and use 2.5 Flash
+                # Enable thinking mode with AI Studio format
                 from google.genai import types
                 
-                # Configure thinking mode
+                # Configure thinking mode using AI Studio format
                 thinking_config = None
                 if self.thinking_budget == -1:
-                    # Dynamic thinking - let the model decide how much thinking it needs
-                    thinking_config = types.ThinkingConfig()
+                    thinking_config = types.ThinkingConfig(thinking_budget=-1)
                     logger.info("Using dynamic thinking mode")
                 else:
-                    # Fixed thinking budget
-                    thinking_config = types.ThinkingConfig(
-                        max_thinking_tokens=self.thinking_budget
-                    )
+                    thinking_config = types.ThinkingConfig(thinking_budget=self.thinking_budget)
                     logger.info(f"Using fixed thinking budget: {self.thinking_budget} tokens")
+                
+                # Simplified content structure per API docs
+                generate_content_config = types.GenerateContentConfig(
+                    temperature=0.2, 
+                    thinking_config=thinking_config,
+                    system_instruction=self.system_instruction
+                )
                 
                 response = self.client.models.generate_content(
                     model=self.model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        thinking_config=thinking_config
-                    )
+                    contents=prompt,  # Simplified: direct string
+                    config=generate_content_config
                 )
                 analysis_text = response.text
                 
@@ -84,7 +105,7 @@ Please provide your analysis and end with exactly one of: "CLASSIFICATION: Fits"
                         usage = response.usage_metadata
                         input_tokens = getattr(usage, 'prompt_token_count', 0)
                         output_tokens = getattr(usage, 'candidates_token_count', 0)
-                        thinking_tokens = getattr(usage, 'thinking_token_count', 0)
+                        thinking_tokens = getattr(usage, 'thoughts_token_count', 0)
                         self.total_input_tokens += input_tokens
                         self.total_output_tokens += output_tokens
                         logger.info(f"Tokens used - Input: {input_tokens}, Output: {output_tokens}, Thinking: {thinking_tokens}")
@@ -92,14 +113,39 @@ Please provide your analysis and end with exactly one of: "CLASSIFICATION: Fits"
                 except Exception as token_error:
                     logger.debug(f"Could not track tokens: {token_error}")
                 
-                # Extract classification from the response
-                if "CLASSIFICATION: Fits" in analysis_text:
-                    classification = "Fits"
-                elif "CLASSIFICATION: Does Not Fit" in analysis_text:
-                    classification = "Does Not Fit"
-                else:
-                    logger.warning("Could not extract classification from response")
-                    classification = "Unknown"
+                # Extract classification from the JSON response
+                import re
+                
+                classification = "Unknown"
+                try:
+                    # Try to extract JSON from the response
+                    json_match = re.search(r'\{[^}]*"CLASSIFICATION"[^}]*\}', analysis_text, re.DOTALL)
+                    if json_match:
+                        json_str = json_match.group()
+                        parsed = json.loads(json_str)
+                        classification = parsed.get("CLASSIFICATION", "Unknown")
+                    else:
+                        # Fallback: look for classification patterns
+                        if '"CLASSIFICATION": "Well Fits"' in analysis_text:
+                            classification = "Well Fits"
+                        elif '"CLASSIFICATION": "Promising"' in analysis_text:
+                            classification = "Promising"
+                        elif '"CLASSIFICATION": "Does Not Fit"' in analysis_text:
+                            classification = "Does Not Fit"
+                        else:
+                            logger.warning(f"Could not extract classification from response for job")
+                            classification = "Unknown"
+                except Exception as e:
+                    logger.warning(f"Error parsing JSON response: {e}")
+                    # Fallback parsing
+                    if "Well Fits" in analysis_text:
+                        classification = "Well Fits"
+                    elif "Promising" in analysis_text:
+                        classification = "Promising"
+                    elif "Does Not Fit" in analysis_text:
+                        classification = "Does Not Fit"
+                    else:
+                        classification = "Unknown"
                 
                 return analysis_text, classification
                 
@@ -152,6 +198,13 @@ Please provide your analysis and end with exactly one of: "CLASSIFICATION: Fits"
         logger.info(f"Total jobs to process: {total_jobs}")
         logger.info(f"Starting from index: {start_index}")
         
+        logger.info("Serial processing")
+        self.process_jobs_serial(df, output_file, start_index)
+
+    def process_jobs_serial(self, df: pd.DataFrame, output_file: str, start_index: int = 0):
+        """Serial processing"""
+        total_jobs = len(df)
+        
         # Process each job starting from start_index
         for idx in range(start_index, total_jobs):
             if idx % 10 == 0:
@@ -181,8 +234,8 @@ Please provide your analysis and end with exactly one of: "CLASSIFICATION: Fits"
                 df.to_csv(output_file, index=False)
             
             # Rate limiting - configurable delay between API calls
-            logger.info(f"Waiting {self.delay_between_requests} seconds before next request...")
-            time.sleep(self.delay_between_requests)
+            if self.delay_between_requests > 0:
+                time.sleep(self.delay_between_requests)
         
         # Final save
         logger.info("Saving final results")
@@ -205,7 +258,53 @@ Please provide your analysis and end with exactly one of: "CLASSIFICATION: Fits"
         estimated_cost = (self.total_input_tokens * 0.000075 / 1000) + (self.total_output_tokens * 0.0003 / 1000)
         logger.info(f"  Estimated Cost: ${estimated_cost:.4f}")  
 
+def create_parser():
+    """Create and configure the argument parser"""
+    parser = argparse.ArgumentParser(
+        description='Job analysis using Gemini 2.5 Flash with system instructions',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage - analyze jobs.csv, output to jobs_analyzed.csv
+  python analyze_jobs_with_gemini.py jobs.csv
+  
+  # Fast processing (reduced delay for thousands of jobs)
+  python analyze_jobs_with_gemini.py jobs.csv --delay 5
+  
+  # Disable thinking mode for speed
+  python analyze_jobs_with_gemini.py jobs.csv --thinking-budget 0
+  
+  # Resume from specific index
+  python analyze_jobs_with_gemini.py jobs.csv --start-index 100
+  
+  # Custom output file
+  python analyze_jobs_with_gemini.py jobs.csv --output custom_results.csv
+        """)
+    
+    parser.add_argument('input_file', 
+                       help='Input CSV file containing job data')
+    
+    parser.add_argument('--output', '-o',
+                       help='Output CSV file (default: [input]_analyzed.csv)')
+    
+    parser.add_argument('--start-index', '-s',
+                       type=int, default=0,
+                       help='Starting index for processing (default: 0)')
+    
+    parser.add_argument('--delay', '-d',
+                       type=float, default=60.0,
+                       help='Delay between requests in seconds (default: 60.0)')
+    
+    parser.add_argument('--thinking-budget', '-t',
+                       type=int, default=-1,
+                       help='Thinking budget in tokens (-1 for dynamic, 0 for disabled, positive for fixed, default: -1)')
+    
+    return parser
+
 def main():
+    parser = create_parser()
+    args = parser.parse_args()
+    
     # Check for API key
     api_key = os.environ.get('GEMINI_API_KEY')
     if not api_key:
@@ -215,52 +314,55 @@ def main():
         print("export GEMINI_API_KEY='your-api-key-here'")
         sys.exit(1)
     
-    print("Starting job analysis with Gemini 2.5 Flash (with thinking mode)...")
-    print("This will analyze each job in filtered_jobs_tier5.csv")
-    print("Results will be saved to filtered_jobs_tier5_analyzed.csv")
-    print(f"\nNote: This will take a while as there are many jobs to process")
-    print("The script saves progress every 10 jobs, so you can stop and restart if needed")
+    # Determine input and output files
+    input_file = args.input_file
+    if args.output:
+        output_file = args.output
+    else:
+        # Generate output filename: input.csv -> input_analyzed.csv
+        base_name = os.path.splitext(input_file)[0]
+        output_file = f"{base_name}_analyzed.csv"
     
-    # Get parameters from command line or user input
-    start_index = 0
-    delay = 5.0  # Default 5 seconds based on generous rate limits for 2.5 Flash
-    thinking_budget = -1  # Default dynamic thinking (let model decide)
+    # Validate input file exists
+    if not os.path.exists(input_file):
+        print(f"Error: Input file '{input_file}' does not exist")
+        sys.exit(1)
     
-    if len(sys.argv) > 1:
-        start_index = int(sys.argv[1])
-    if len(sys.argv) > 2:
-        delay = float(sys.argv[2])
-    if len(sys.argv) > 3:
-        thinking_budget = int(sys.argv[3])
+    print(f"Starting job analysis with Gemini 2.5 Flash...")
+    print(f"Input file: {input_file}")
+    print(f"Output file: {output_file}")
     
-    if len(sys.argv) <= 3:
-        try:
-            start_input = input(f"\nEnter starting index (0 to start from beginning): ").strip()
-            if start_input:
-                start_index = int(start_input)
-            
-            delay_input = input(f"Enter delay between requests in seconds (default 5 for generous rate limits): ").strip()
-            if delay_input:
-                delay = float(delay_input)
-                
-            thinking_input = input(f"Enter thinking budget in tokens (-1 for dynamic, or fixed number like 32768): ").strip()
-            if thinking_input:
-                thinking_budget = int(thinking_input)
-        except (ValueError, KeyboardInterrupt):
-            print(f"\nUsing defaults - start index: {start_index}, delay: {delay} seconds, thinking budget: {thinking_budget}")
+    print(f"\nConfiguration:")
+    print(f"  Starting index: {args.start_index}")
+    print(f"  Processing mode: Serial")
+    print(f"  Delay between requests: {args.delay} seconds")
+    thinking_mode = "Dynamic" if args.thinking_budget == -1 else "Disabled" if args.thinking_budget == 0 else f"Fixed ({args.thinking_budget} tokens)"
+    print(f"  Thinking mode: {thinking_mode}")
     
-    print(f"Starting analysis from index: {start_index}")
-    print(f"Delay between requests: {delay} seconds")
-    thinking_mode = "Dynamic (let model decide)" if thinking_budget == -1 else f"{thinking_budget} tokens"
-    print(f"Thinking mode: {thinking_mode}")
-    print(f"Estimated time for remaining jobs: {delay * 72 / 60:.1f} minutes")
+    # Estimate time and cost based on input file
+    try:
+        df = pd.read_csv(input_file)
+        total_jobs = len(df)
+        remaining_jobs = max(0, total_jobs - args.start_index)
+        
+        print(f"  Total jobs in file: {total_jobs}")
+        print(f"  Remaining jobs: {remaining_jobs}")
+        
+        estimated_time = remaining_jobs * args.delay / 60
+        estimated_cost = remaining_jobs * 0.02  #  estimate
+        print(f"  Estimated time: {estimated_time:.1f} minutes")
+        print(f"  Estimated cost: ~${estimated_cost:.2f}")
+        
+    except Exception as e:
+        print(f"  Could not estimate time/cost: {e}")
     
     # Initialize analyzer and run
-    input_file = 'filtered_jobs_tier5.csv'
-    output_file = 'filtered_jobs_tier5_analyzed.csv'
-    
-    analyzer = JobAnalyzer(api_key, delay_between_requests=delay, thinking_budget=thinking_budget)
-    analyzer.process_jobs(input_file, output_file, start_index)
+    analyzer = JobAnalyzer(
+        api_key, 
+        delay_between_requests=args.delay,
+        thinking_budget=args.thinking_budget
+    )
+    analyzer.process_jobs(input_file, output_file, args.start_index)
 
 if __name__ == "__main__":
     main()
